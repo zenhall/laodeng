@@ -18,6 +18,10 @@ from time import mktime
 import _thread as thread
 import sounddevice as sd
 import numpy as np
+import socket
+import threading
+import wave
+import os
 
 STATUS_FIRST_FRAME = 0  # 第一帧的标识
 STATUS_CONTINUE_FRAME = 1  # 中间帧标识
@@ -68,31 +72,28 @@ class Ws_Param(object):
 
 # 全局变量，用于跟踪最后一次检测到声音的时间
 last_sound_time = time.time()
-silence_threshold = 0.01  # 声音阈值，低于此值视为静音
+silence_threshold = 100  # 增大声音阈值
 silence_duration = 1.0  # 静音持续1秒判定为一句话结束
 has_speech_content = False  # 跟踪是否有识别内容
 
 # 收到websocket消息的处理
 def on_message(ws, message):
-    global has_speech_content
     try:
         code = json.loads(message)["code"]
         sid = json.loads(message)["sid"]
         if code != 0:
             errMsg = json.loads(message)["message"]
-            print("sid:%s call error:%s code is:%s" % (sid, errMsg, code))
+            print(f"\n识别错误 sid: {sid}, 错误信息: {errMsg}, 错误码: {code}")
         else:
             data = json.loads(message)["data"]["result"]["ws"]
             result = ""
             for i in data:
                 for w in i["cw"]:
                     result += w["w"]
-            # 检查结果是否包含非标点符号的文字
-            if any(c.isalnum() or c.isalpha() for c in result):  # 检查是否包含字母或数字
-                has_speech_content = True
-                print(f"识别结果: {result}", end='\r')
+            if result.strip():
+                print(f"\n识别结果: {result}")
     except Exception as e:
-        print("receive msg,but parse exception:", e)
+        print("\n解析消息出错:", e)
 
 
 # 收到websocket错误的处理
@@ -101,12 +102,18 @@ def on_error(ws, error):
 
 
 # 收到websocket关闭的处理
-def on_close(ws, a, b):
-    ws.is_connected = False  # 标记连接已关闭
+def on_close(ws, *args):
     print("### closed ###")
-    print("正在尝试重新连接...")
+    ws.is_connected = False
     time.sleep(2)
-    main()
+    print("正在尝试重新连接...")
+    websocket.enableTrace(False)
+    wsParam = ws.wsParam
+    wsUrl = wsParam.create_url()
+    ws = websocket.WebSocketApp(wsUrl, on_message=on_message, on_error=on_error,
+                               on_close=on_close, on_open=on_open)
+    ws.wsParam = wsParam
+    ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
 
 
 # 收到websocket连接建立的处理
@@ -117,90 +124,131 @@ def on_open(ws):
         status = STATUS_FIRST_FRAME
         wsParam = ws.wsParam
         
-        # 定义音频参数
-        samplerate = 16000  # 采样率
-        channels = 1  # 单声道
-        
-        # 添加连接状态标志
         ws.is_connected = True
+        server = None
+        client_socket = None
 
-        def audio_callback(indata, frames, time_info, status):
-            global last_sound_time, has_speech_content
-            
-            # 如果连接已关闭，不再发送数据
-            if not ws.is_connected:
-                return
-            
-            if status:
-                print(status)
-            
-            audio_data = indata.copy()
-            audio_level = np.abs(audio_data).mean()
-            
-            if audio_level > silence_threshold:
+        try:
+            # 创建TCP服务器
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # 添加socket选项，允许地址重用
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(('0.0.0.0', 8080))
+            server.listen(1)
+            print("等待ESP32连接...")
+            client_socket, addr = server.accept()
+            print(f"ESP32已连接: {addr}")
+
+            def process_audio_data():
+                first_frame = True
+                global has_speech_content, last_sound_time
+                silence_threshold = 100  # 声音阈值
+                silence_duration = 1.0   # 静音判断时长
                 last_sound_time = time.time()
-            else:
-                current_time = time.time()
-                if current_time - last_sound_time > silence_duration and has_speech_content:
-                    print("\nover")
-                    last_sound_time = current_time
-                    has_speech_content = False
-            
-            audio_data = (audio_data * 32767).astype(np.int16).tobytes()
-            
-            try:
-                nonlocal first_frame
-                if first_frame:
-                    d = {
-                        "common": wsParam.CommonArgs,
-                        "business": wsParam.BusinessArgs,
-                        "data": {
-                            "status": 0,
-                            "format": "audio/L16;rate=16000",
-                            "audio": str(base64.b64encode(audio_data), 'utf-8'),
-                            "encoding": "raw"
-                        }
-                    }
-                    ws.send(json.dumps(d))
-                    first_frame = False
-                else:
-                    d = {
-                        "data": {
-                            "status": 1,
-                            "format": "audio/L16;rate=16000",
-                            "audio": str(base64.b64encode(audio_data), 'utf-8'),
-                            "encoding": "raw"
-                        }
-                    }
-                    ws.send(json.dumps(d))
-            except Exception as e:
-                ws.is_connected = False
-                print(f"发送数据时出错: {e}")
+                has_speech_content = False
+                
+                try:
+                    while ws.is_connected:
+                        try:
+                            audio_data = client_socket.recv(2048)
+                            if not audio_data:
+                                break
 
-        print("开始录音，请说话...")
-        first_frame = True
-        
-        # 开始录音
-        with sd.InputStream(samplerate=samplerate, 
-                          channels=channels,
-                          blocksize=frameSize,
-                          callback=audio_callback):
-            try:
-                while True:
-                    time.sleep(0.1)  # 保持麦克风开启
-            except KeyboardInterrupt:
-                # 发送最后一帧
-                d = {
-                    "data": {
-                        "status": 2,
-                        "format": "audio/L16;rate=16000",
-                        "audio": str(base64.b64encode(b''), 'utf-8'),
-                        "encoding": "raw"
-                    }
-                }
-                ws.send(json.dumps(d))
-                print("\n录音结束")
-                ws.close()
+                            # 将字节数据转换为numpy数组用于分析
+                            audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                            
+                            if len(audio_array) == 0:
+                                continue
+                            
+                            # 计算音频电平
+                            audio_level = np.abs(audio_array).mean()
+                            max_level = np.max(np.abs(audio_array))
+                            
+                            print(f"\r音频电平: {audio_level:.2f}, 最大值: {max_level}", end='')
+                            
+                            # 检测声音活动
+                            if audio_level > silence_threshold:
+                                last_sound_time = time.time()
+                                has_speech_content = True
+                                
+                                try:
+                                    if first_frame:
+                                        d = {
+                                            "common": wsParam.CommonArgs,
+                                            "business": wsParam.BusinessArgs,
+                                            "data": {
+                                                "status": STATUS_FIRST_FRAME,
+                                                "format": "audio/L16;rate=16000",
+                                                "audio": str(base64.b64encode(audio_data), 'utf-8'),
+                                                "encoding": "raw"
+                                            }
+                                        }
+                                        ws.send(json.dumps(d))
+                                        first_frame = False
+                                        print("\n开始新的语音识别...")
+                                    else:
+                                        d = {
+                                            "data": {
+                                                "status": STATUS_CONTINUE_FRAME,
+                                                "format": "audio/L16;rate=16000",
+                                                "audio": str(base64.b64encode(audio_data), 'utf-8'),
+                                                "encoding": "raw"
+                                            }
+                                        }
+                                        ws.send(json.dumps(d))
+                                except Exception as e:
+                                    print(f"\n发送数据时出错: {e}")
+                                    break
+                            else:
+                                # 检查是否需要发送结束帧
+                                current_time = time.time()
+                                if current_time - last_sound_time > silence_duration and has_speech_content:
+                                    try:
+                                        d = {
+                                            "data": {
+                                                "status": STATUS_LAST_FRAME,
+                                                "format": "audio/L16;rate=16000",
+                                                "audio": str(base64.b64encode(b''), 'utf-8'),
+                                                "encoding": "raw"
+                                            }
+                                        }
+                                        ws.send(json.dumps(d))
+                                        print("\n检测到语音结束，等待识别结果...")
+                                        first_frame = True
+                                        has_speech_content = False
+                                    except Exception as e:
+                                        print(f"\n发送结束帧时出错: {e}")
+
+                        except Exception as e:
+                            print(f"\n接收数据时出错: {e}")
+                            break
+
+                except Exception as e:
+                    print(f"\n音频处理错误: {e}")
+                finally:
+                    if client_socket:
+                        client_socket.close()
+                    
+                    # 打印最终统计信息
+                    print(f"总样本数: {total_samples}")
+                    print(f"文件大小: {os.path.getsize('recorded_audio.wav') / 1024:.1f} KB")
+                    print(f"录音时长: {total_samples / 16000:.1f} 秒")
+
+            # 在新线程中处理音频数据
+            audio_thread = threading.Thread(target=process_audio_data)
+            audio_thread.start()
+
+            while ws.is_connected:
+                time.sleep(0.1)
+
+        except Exception as e:
+            print(f"服务器错误: {e}")
+        finally:
+            if client_socket:
+                client_socket.close()
+            if server:
+                server.close()
+            ws.is_connected = False
 
     thread.start_new_thread(run, ())
 
