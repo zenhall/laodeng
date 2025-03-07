@@ -10,28 +10,33 @@ import re
 result_queue = Queue()  # 语音识别结果队列
 input_queue = Queue()   # AI输入队列
 
+# 保存原始的on_message函数
+original_on_message = iat.on_message
+
 def custom_on_message(ws, message):
     try:
+        # 首先调用原始的on_message函数，保持iat.py的功能完整
+        original_on_message(ws, message)
+        
+        # 然后处理我们自己的逻辑
         code = json.loads(message)["code"]
         sid = json.loads(message)["sid"]
         if code != 0:
-            errMsg = json.loads(message)["message"]
-            print("sid:%s call error:%s code is:%s" % (sid, errMsg, code))
-        else:
-            data = json.loads(message)["data"]["result"]["ws"]
-            result = ""
-            for i in data:
-                for w in i["cw"]:
-                    result += w["w"]
-            if any(c.isalnum() or c.isalpha() for c in result):
-                iat.has_speech_content = True
-                # 更新队列中的最新结果（清空旧结果）
-                while not result_queue.empty():
-                    result_queue.get()
-                result_queue.put(result)
-                print(f"识别结果: {result}")
+            return
+        
+        data = json.loads(message)["data"]["result"]["ws"]
+        result = ""
+        for i in data:
+            for w in i["cw"]:
+                result += w["w"]
+        
+        if any(c.isalnum() or c.isalpha() for c in result):
+            # 更新队列中的最新结果（清空旧结果）
+            while not result_queue.empty():
+                result_queue.get()
+            result_queue.put(result)
     except Exception as e:
-        print("receive msg,but parse exception:", e)
+        print("custom_on_message exception:", e)
 
 # 监听iat的over信号
 def listen_for_over():
@@ -45,26 +50,16 @@ def listen_for_over():
             
         def write(self, text):
             original_stdout.write(text)
-            self.buffer += text
             
-            # 使用正则表达式匹配独立的"over"单词
-            if re.search(r'\bover\b', self.buffer) and (time.time() - self.last_over_time) > 2:
-                self.last_over_time = time.time()
+            # 直接检查当前文本是否包含"over"
+            current_time = time.time()
+            if "over" in text and (current_time - self.last_over_time) > 2:
+                self.last_over_time = current_time
                 # 检测到over信号，处理最后的识别结果
                 if not result_queue.empty():
                     final_result = result_queue.get()
                     print(f"\n检测到语音结束，最终结果: {final_result}")
                     handle_voice_result(final_result)
-                # 清空缓冲区，准备下一次检测
-                self.buffer = ""
-                # 重置iat状态，准备下一次识别
-                iat.has_speech_content = False
-                iat.last_result = ""
-                iat.speech_ended = False
-            
-            # 保持缓冲区在合理大小
-            if len(self.buffer) > 1000:
-                self.buffer = self.buffer[-500:]
             
         def flush(self):
             original_stdout.flush()
@@ -72,7 +67,9 @@ def listen_for_over():
     sys.stdout = OverDetector()
 
 def run_iat():
+    # 设置自定义的on_message函数
     iat.on_message = custom_on_message
+    
     while True:
         try:
             iat.main()
