@@ -16,12 +16,10 @@ from wsgiref.handlers import format_date_time
 from datetime import datetime
 from time import mktime
 import _thread as thread
-import sounddevice as sd
-import numpy as np
 import socket
+import struct
+import numpy as np
 import threading
-import wave
-import os
 
 STATUS_FIRST_FRAME = 0  # 第一帧的标识
 STATUS_CONTINUE_FRAME = 1  # 中间帧标识
@@ -70,30 +68,69 @@ class Ws_Param(object):
         return url
 
 
-# 全局变量，用于跟踪最后一次检测到声音的时间
-last_sound_time = time.time()
-silence_threshold = 100  # 增大声音阈值
-silence_duration = 1.0  # 静音持续1秒判定为一句话结束
+# 全局变量
+last_result = ""  # 用于存储上一次的识别结果
 has_speech_content = False  # 跟踪是否有识别内容
+last_update_time = time.time()  # 上次结果更新时间
+TIMEOUT = 1.0  # 超时时间为1秒
+speech_ended = False  # 标记语音是否结束
+last_content_length = 0  # 记录上次内容的长度（不包括标点）
+
+# 检查超时的线程函数
+def check_timeout():
+    global last_result, has_speech_content, last_update_time, speech_ended
+    while True:
+        if has_speech_content and not speech_ended:
+            current_time = time.time()
+            time_since_last_update = current_time - last_update_time
+            if time_since_last_update > TIMEOUT:
+                print("over")
+                speech_ended = True
+        time.sleep(0.1)  # 每0.1秒检查一次
+
+# 移除标点符号的函数
+def remove_punctuation(text):
+    punctuation = '，。！？、；：""''（）【】《》〈〉…—～,.!?;:\'\"()[]<>…-~'
+    return ''.join(char for char in text if char not in punctuation)
 
 # 收到websocket消息的处理
 def on_message(ws, message):
+    global last_result, has_speech_content, last_update_time, speech_ended, last_content_length
     try:
         code = json.loads(message)["code"]
         sid = json.loads(message)["sid"]
         if code != 0:
             errMsg = json.loads(message)["message"]
-            print(f"\n识别错误 sid: {sid}, 错误信息: {errMsg}, 错误码: {code}")
+            print("sid:%s call error:%s code is:%s" % (sid, errMsg, code))
         else:
             data = json.loads(message)["data"]["result"]["ws"]
             result = ""
             for i in data:
                 for w in i["cw"]:
                     result += w["w"]
-            if result.strip():
-                print(f"\n识别结果: {result}")
+            
+            # 移除标点符号后比较内容
+            result_no_punct = remove_punctuation(result)
+            last_result_no_punct = remove_punctuation(last_result)
+            
+            # 只有当非标点内容有变化时才更新时间戳
+            if len(result_no_punct) > len(last_result_no_punct):
+                speech_ended = False  # 有新内容，重置语音结束标志
+                has_speech_content = True
+                print(f"识别结果: {result}")
+                last_result = result
+                last_update_time = time.time()
+                last_content_length = len(result_no_punct)
+            
+            # 如果检测到语音已结束，重置状态
+            if speech_ended:
+                has_speech_content = False
+                last_result = ""
+                last_content_length = 0
+                speech_ended = False
+                
     except Exception as e:
-        print("\n解析消息出错:", e)
+        print("receive msg,but parse exception:", e)
 
 
 # 收到websocket错误的处理
@@ -102,154 +139,92 @@ def on_error(ws, error):
 
 
 # 收到websocket关闭的处理
-def on_close(ws, *args):
+def on_close(ws, a, b):
+    ws.is_connected = False  # 标记连接已关闭
     print("### closed ###")
-    ws.is_connected = False
-    time.sleep(2)
     print("正在尝试重新连接...")
-    websocket.enableTrace(False)
-    wsParam = ws.wsParam
-    wsUrl = wsParam.create_url()
-    ws = websocket.WebSocketApp(wsUrl, on_message=on_message, on_error=on_error,
-                               on_close=on_close, on_open=on_open)
-    ws.wsParam = wsParam
-    ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+    time.sleep(2)
+    main()
 
 
 # 收到websocket连接建立的处理
 def on_open(ws):
     def run(*args):
         frameSize = 8000
-        intervel = 0.04
-        status = STATUS_FIRST_FRAME
         wsParam = ws.wsParam
         
+        # 设置TCP服务器
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind(('0.0.0.0', 8080))
+        server_socket.listen(1)
+        print("等待ESP32连接...")
+        client_socket, addr = server_socket.accept()
+        print(f"ESP32已连接，地址: {addr}")
+        
+        # 添加连接状态标志
         ws.is_connected = True
-        server = None
-        client_socket = None
+        first_frame = True
 
         try:
-            # 创建TCP服务器
-            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            # 添加socket选项，允许地址重用
-            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server.bind(('0.0.0.0', 8080))
-            server.listen(1)
-            print("等待ESP32连接...")
-            client_socket, addr = server.accept()
-            print(f"ESP32已连接: {addr}")
-
-            def process_audio_data():
-                first_frame = True
-                global has_speech_content, last_sound_time
-                silence_threshold = 100  # 声音阈值
-                silence_duration = 1.0   # 静音判断时长
-                last_sound_time = time.time()
-                has_speech_content = False
+            while ws.is_connected:
+                # 从ESP32读取音频数据
+                audio_data = client_socket.recv(frameSize)
+                if not audio_data:
+                    break
                 
                 try:
-                    while ws.is_connected:
-                        try:
-                            audio_data = client_socket.recv(2048)
-                            if not audio_data:
-                                break
-
-                            # 将字节数据转换为numpy数组用于分析
-                            audio_array = np.frombuffer(audio_data, dtype=np.int16)
-                            
-                            if len(audio_array) == 0:
-                                continue
-                            
-                            # 计算音频电平
-                            audio_level = np.abs(audio_array).mean()
-                            max_level = np.max(np.abs(audio_array))
-                            
-                            print(f"\r音频电平: {audio_level:.2f}, 最大值: {max_level}", end='')
-                            
-                            # 检测声音活动
-                            if audio_level > silence_threshold:
-                                last_sound_time = time.time()
-                                has_speech_content = True
-                                
-                                try:
-                                    if first_frame:
-                                        d = {
-                                            "common": wsParam.CommonArgs,
-                                            "business": wsParam.BusinessArgs,
-                                            "data": {
-                                                "status": STATUS_FIRST_FRAME,
-                                                "format": "audio/L16;rate=16000",
-                                                "audio": str(base64.b64encode(audio_data), 'utf-8'),
-                                                "encoding": "raw"
-                                            }
-                                        }
-                                        ws.send(json.dumps(d))
-                                        first_frame = False
-                                        print("\n开始新的语音识别...")
-                                    else:
-                                        d = {
-                                            "data": {
-                                                "status": STATUS_CONTINUE_FRAME,
-                                                "format": "audio/L16;rate=16000",
-                                                "audio": str(base64.b64encode(audio_data), 'utf-8'),
-                                                "encoding": "raw"
-                                            }
-                                        }
-                                        ws.send(json.dumps(d))
-                                except Exception as e:
-                                    print(f"\n发送数据时出错: {e}")
-                                    break
-                            else:
-                                # 检查是否需要发送结束帧
-                                current_time = time.time()
-                                if current_time - last_sound_time > silence_duration and has_speech_content:
-                                    try:
-                                        d = {
-                                            "data": {
-                                                "status": STATUS_LAST_FRAME,
-                                                "format": "audio/L16;rate=16000",
-                                                "audio": str(base64.b64encode(b''), 'utf-8'),
-                                                "encoding": "raw"
-                                            }
-                                        }
-                                        ws.send(json.dumps(d))
-                                        print("\n检测到语音结束，等待识别结果...")
-                                        first_frame = True
-                                        has_speech_content = False
-                                    except Exception as e:
-                                        print(f"\n发送结束帧时出错: {e}")
-
-                        except Exception as e:
-                            print(f"\n接收数据时出错: {e}")
-                            break
-
+                    if first_frame:
+                        d = {
+                            "common": wsParam.CommonArgs,
+                            "business": wsParam.BusinessArgs,
+                            "data": {
+                                "status": 0,
+                                "format": "audio/L16;rate=16000",
+                                "audio": str(base64.b64encode(audio_data), 'utf-8'),
+                                "encoding": "raw"
+                            }
+                        }
+                        ws.send(json.dumps(d))
+                        first_frame = False
+                    else:
+                        d = {
+                            "data": {
+                                "status": 1,
+                                "format": "audio/L16;rate=16000",
+                                "audio": str(base64.b64encode(audio_data), 'utf-8'),
+                                "encoding": "raw"
+                            }
+                        }
+                        ws.send(json.dumps(d))
                 except Exception as e:
-                    print(f"\n音频处理错误: {e}")
-                finally:
-                    if client_socket:
-                        client_socket.close()
+                    ws.is_connected = False
+                    print(f"发送数据时出错: {e}")
+                    break
                     
-                    # 打印最终统计信息
-                    print(f"总样本数: {total_samples}")
-                    print(f"文件大小: {os.path.getsize('recorded_audio.wav') / 1024:.1f} KB")
-                    print(f"录音时长: {total_samples / 16000:.1f} 秒")
-
-            # 在新线程中处理音频数据
-            audio_thread = threading.Thread(target=process_audio_data)
-            audio_thread.start()
-
-            while ws.is_connected:
-                time.sleep(0.1)
-
         except Exception as e:
-            print(f"服务器错误: {e}")
+            print(f"接收数据时出错: {e}")
         finally:
-            if client_socket:
-                client_socket.close()
-            if server:
-                server.close()
-            ws.is_connected = False
+            client_socket.close()
+            server_socket.close()
+            
+        # 发送最后一帧
+        d = {
+            "data": {
+                "status": 2,
+                "format": "audio/L16;rate=16000",
+                "audio": str(base64.b64encode(b''), 'utf-8'),
+                "encoding": "raw"
+            }
+        }
+        ws.send(json.dumps(d))
+        ws.close()
 
+    # 启动超时检查线程
+    timeout_thread = threading.Thread(target=check_timeout)
+    timeout_thread.daemon = True
+    timeout_thread.start()
+    
     thread.start_new_thread(run, ())
 
 
