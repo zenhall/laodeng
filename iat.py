@@ -80,12 +80,17 @@ last_content_length = 0  # 记录上次内容的长度（不包括标点）
 def check_timeout():
     global last_result, has_speech_content, last_update_time, speech_ended
     while True:
-        if has_speech_content and not speech_ended:
-            current_time = time.time()
+        current_time = time.time()
+        if has_speech_content:
             time_since_last_update = current_time - last_update_time
             if time_since_last_update > TIMEOUT:
-                print("over")
+                print("检测到语音超时")
+                has_speech_content = False  # 重置状态
                 speech_ended = True
+                last_update_time = current_time  # 更新时间戳
+                # 完全重置状态
+                last_result = ""
+                last_content_length = 0
         time.sleep(0.1)  # 每0.1秒检查一次
 
 # 移除标点符号的函数
@@ -121,13 +126,31 @@ def on_message(ws, message):
                 last_result = result
                 last_update_time = time.time()
                 last_content_length = len(result_no_punct)
-            
-            # 如果检测到语音已结束，重置状态
-            if speech_ended:
-                has_speech_content = False
-                last_result = ""
-                last_content_length = 0
-                speech_ended = False
+                
+                # 如果检测到语音已结束，主动关闭连接
+                if speech_ended and has_speech_content:
+                    print(f"检测到语音结束，最终结果: {last_result}")
+                    d = {
+                        "data": {
+                            "status": 2,
+                            "format": "audio/L16;rate=16000",
+                            "audio": str(base64.b64encode(b''), 'utf-8'),
+                            "encoding": "raw"
+                        }
+                    }
+                    ws.send(json.dumps(d))
+                    # 在适当的延迟后关闭连接
+                    def close_delayed():
+                        time.sleep(0.5)
+                        ws.close()
+                    
+                    thread.start_new_thread(close_delayed, ())
+                    
+                    # 重置状态
+                    has_speech_content = False
+                    last_result = ""
+                    last_content_length = 0
+                    speech_ended = False
                 
     except Exception as e:
         print("receive msg,but parse exception:", e)
@@ -153,12 +176,20 @@ def on_open(ws):
         frameSize = 8000
         wsParam = ws.wsParam
         
-        # 设置TCP服务器
+        # 重置所有状态变量
+        global last_result, has_speech_content, speech_ended, last_content_length, last_update_time
+        last_result = ""
+        has_speech_content = False
+        speech_ended = False
+        last_content_length = 0
+        last_update_time = time.time()
+        
+        # 设置TCP服务器，修改端口为8081以匹配combined.ino的audioPort
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind(('0.0.0.0', 8080))
+        server_socket.bind(('0.0.0.0', 8081))  # 修改为8081
         server_socket.listen(1)
-        print("等待ESP32连接...")
+        print("等待ESP32连接到音频端口8081...")
         client_socket, addr = server_socket.accept()
         print(f"ESP32已连接，地址: {addr}")
         

@@ -109,26 +109,12 @@ def on_open(ws, wsParam):
             os.remove('./response.pcm')
     thread.start_new_thread(run, ())
 
-def text_to_speech(text, xf_params):
-    wsParam = Ws_Param(APPID=xf_params['APPID'],
-                      APIKey=xf_params['APIKey'],
-                      APISecret=xf_params['APISecret'],
-                      Text=text)
-    
-    websocket.enableTrace(False)
-    wsUrl = wsParam.create_url()
-    ws = websocket.WebSocketApp(wsUrl,
-                              on_message=on_message,
-                              on_error=on_error,
-                              on_close=on_close)
-    ws.on_open = lambda ws: on_open(ws, wsParam)
-    ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
-
 class AIChat(threading.Thread):
-    def __init__(self, input_queue):
+    def __init__(self, input_queue, iat_control_event):
         super().__init__()
         self.input_queue = input_queue
         self.running = True
+        self.iat_control_event = iat_control_event
         
         # 配置OpenAI API
         openai.api_base = "https://api.chatanywhere.tech/v1"
@@ -158,10 +144,67 @@ class AIChat(threading.Thread):
                 print("AI:", ai_response)
                 
                 # 将AI回答转换为语音
-                text_to_speech(ai_response, self.xf_params)
+                self.text_to_speech(ai_response)
                 
             except Exception as e:
                 print("错误:", str(e))
+                # 出错时也要恢复语音识别
+                self.iat_control_event.set()
 
     def stop(self):
-        self.running = False 
+        self.running = False
+        
+    def text_to_speech(self, text):
+        # 使用自定义的TTS函数，可以在播放完成后发出信号
+        self.tts_completed = False
+        
+        wsParam = Ws_Param(APPID=self.xf_params['APPID'],
+                          APIKey=self.xf_params['APIKey'],
+                          APISecret=self.xf_params['APISecret'],
+                          Text=text)
+        
+        websocket.enableTrace(False)
+        wsUrl = wsParam.create_url()
+        ws = websocket.WebSocketApp(wsUrl,
+                                  on_message=lambda ws, message: self.on_tts_message(ws, message),
+                                  on_error=on_error,
+                                  on_close=on_close)
+        ws.on_open = lambda ws: on_open(ws, wsParam)
+        ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+    
+    def on_tts_message(self, ws, message):
+        try:
+            message = json.loads(message)
+            code = message["code"]
+            audio = message["data"]["audio"]
+            audio = base64.b64decode(audio)
+            status = message["data"]["status"]
+            
+            if code == 0:
+                with open('./response.pcm', 'ab') as f:
+                    f.write(audio)
+            
+            if status == 2:
+                print("语音合成完成")
+                def close_conn():
+                    time.sleep(0.5)
+                    print("开始播放...")
+                    # 确保IAT暂停
+                    self.iat_control_event.clear()
+                    
+                    # 播放TTS音频
+                    play_audio('./response.pcm')
+                    print("播放完成")
+                    
+                    # 延长恢复等待时间，确保有足够的缓冲时间
+                    time.sleep(2.0)
+                    
+                    print("正在重新激活语音识别...")
+                    self.iat_control_event.set()
+                    ws.close()
+                thread.start_new_thread(close_conn, ())
+        except Exception as e:
+            print("TTS异常:", e)
+            # 出错时也要恢复语音识别，但需要延迟一下
+            time.sleep(1.0)
+            self.iat_control_event.set() 
