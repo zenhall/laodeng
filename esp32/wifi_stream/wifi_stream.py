@@ -9,6 +9,9 @@ import base64
 import io
 from PIL import Image
 from openai import OpenAI
+from test import RobotController
+
+FRAME_PROCESS_INTERVAL = 3  # 处理帧之间的间隔时间（秒）3秒用于演示，实际修改为360即为一小时提醒
 
 class ESP32_Camera_Stream:
     def __init__(self, url, socket_host=None, socket_port=None):
@@ -33,9 +36,20 @@ class ESP32_Camera_Stream:
             api_key="sk-CkxIb6MfdTBgZkdm0MtUEGVGk6Q6o5X5BRB1DwE2BdeSLSqB"  # 本地服务不需要API密钥
         )
         
+        # 添加舵机位置常量
+        self.HEAD_LEFT = [1688, 1816, 2737, 2628, 2878]
+        self.HEAD_RIGHT = [2141, 1816, 2737, 2628, 2878]
+        self.WARNING_POSITION = [1900, 2100, 2100, 2950, 2878]
+        self.REST_POSITION = [1961, 875, 3094, 3152, 2998]  # 添加休息位置
+        
         # 添加计数器
         self.human_count = 0
-        self.false_count = 0
+        self.false_count = 0  # 用于跟踪连续False的次数
+        
+        # 添加RobotController实例
+        self.controller = RobotController()
+        self.controller.start_servers()
+        time.sleep(2)  # 等待连接建立
 
     def start(self):
         """启动视频流处理"""
@@ -110,14 +124,72 @@ class ESP32_Camera_Stream:
             print(f"GPT4O-mini API调用错误: {e}")
             return False
 
+    def _map_count_to_color(self, count):
+        """将计数值(0-20)映射为LED颜色
+        
+        Args:
+            count: 当前计数值(0-20)
+        
+        Returns:
+            tuple: (r, g, b)值
+        """
+        # 确保count在0-20范围内
+        count = max(0, min(20, count))
+        
+        # 计算红色和绿色分量
+        # count越大，红色越强，绿色越弱
+        red = int((count / 20.0) * 255)
+        green = int(((20 - count) / 20.0) * 255)
+        
+        return (red, green, 0)  # 不使用蓝色分量
+
+    def shake_head(self):
+        """执行两次来回的摇头动作"""
+        for _ in range(2):  # 两次来回
+            # 向左摇头
+            self.controller.set_servo_positions(self.HEAD_LEFT)
+            time.sleep(1)  # 等待动作完成
+            
+            # 向右摇头
+            self.controller.set_servo_positions(self.HEAD_RIGHT)
+            time.sleep(1)  # 等待动作完成
+            
+        # 回到中间位置
+        middle_position = [
+            (self.HEAD_LEFT[0] + self.HEAD_RIGHT[0]) // 2,
+            self.HEAD_LEFT[1],
+            self.HEAD_LEFT[2],
+            self.HEAD_LEFT[3],
+            self.HEAD_LEFT[4]
+        ]
+        self.controller.set_servo_positions(middle_position)
+
+    def warning_action(self):
+        """执行警告动作和红白闪烁"""
+        # 移动到警告位置
+        self.controller.set_servo_positions(self.WARNING_POSITION)
+        
+        # 红白闪烁5次
+        for _ in range(5):
+            # 设置为红色
+            self.controller.set_all_leds(255, 0, 0)
+            time.sleep(1)
+            # 设置为白色
+            self.controller.set_all_leds(255, 255, 255)
+            time.sleep(1)
+        
+        # 恢复到当前计数对应的颜色
+        r, g, b = self._map_count_to_color(self.human_count)
+        self.controller.set_all_leds(r, g, b)
+
     def process_frames(self):
-        """每3秒处理一帧并显示"""
+        """每FRAME_PROCESS_INTERVAL秒处理一帧并显示"""
         last_frame_time = time.time()
         
         while True:
             current_time = time.time()
             
-            if not self.frame_queue.empty() and (current_time - last_frame_time) >= 3:
+            if not self.frame_queue.empty() and (current_time - last_frame_time) >= FRAME_PROCESS_INTERVAL:
                 frame = self.frame_queue.get()
                 last_frame_time = current_time
                 
@@ -136,14 +208,21 @@ class ESP32_Camera_Stream:
                         self.human_count = 0
                         self.false_count = 0
                         print("连续两次未检测到人，计数已重置")
+                        # 移动到休息位置
+                        self.controller.set_servo_positions(self.REST_POSITION)
                 
                 # 检查累计次数并打印
                 if self.human_count == 10:
                     print("达到10次 -> 1H")
+                    self.shake_head()  # 执行摇头动作
                 elif self.human_count == 20:
                     print("达到20次 -> 2H")
-                    self.human_count = 0  # 达到20次后重置计数
-                    print("计数已重置为0")
+                    self.warning_action()  # 执行警告动作和闪烁
+                    # 不再在此处重置计数
+                
+                # 更新LED颜色
+                r, g, b = self._map_count_to_color(self.human_count)
+                self.controller.set_all_leds(r, g, b)
                 
                 # 显示时间戳和检测结果
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -166,6 +245,9 @@ class ESP32_Camera_Stream:
     def stop(self):
         """停止视频流处理"""
         self.is_running = False
+        # 关闭LED
+        self.controller.set_all_leds(0, 0, 0)
+        self.controller.stop()
 
 def main():
     # ESP32摄像头流地址和Socket服务器配置
