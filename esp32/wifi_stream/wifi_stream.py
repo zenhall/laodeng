@@ -1,11 +1,14 @@
 import cv2
 import numpy as np
-from ultralytics import YOLO
 import requests
 import time
 from threading import Thread
 import queue
 import socket
+import base64
+import io
+from PIL import Image
+from openai import OpenAI
 
 class ESP32_Camera_Stream:
     def __init__(self, url, socket_host=None, socket_port=None):
@@ -20,32 +23,20 @@ class ESP32_Camera_Stream:
         self.frame_queue = queue.Queue(maxsize=2)
         self.is_running = False
         
-        # 加载YOLO模型
-        self.model = YOLO('best.pt')
-        self.model.conf = 0.4
-        
-        # 初始化socket连接
-        self.socket_client = None
-        if socket_host and socket_port:
-            try:
-                self.socket_client = socket.socket()
-                self.socket_client.connect((socket_host, socket_port))
-                print("成功连接到Socket服务器")
-            except Exception as e:
-                print(f"Socket连接失败: {e}")
-                self.socket_client = None
-        
-        # 添加颜色映射
-        self.colors = {
-            # 为每个类别随机生成一个颜色
-            i: tuple(map(int, np.random.randint(0, 255, size=3)))
-            for i in range(len(self.model.names))
-        }
-        
         # 添加窗口名称并设置为可缩放
-        self.window_name = 'ESP32 YOLO Detection'
+        self.window_name = 'ESP32 Camera'
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
         
+        # 初始化OpenAI客户端
+        self.client = OpenAI(
+            base_url="https://api.chatanywhere.tech/v1",  # GPT4O-mini服务器地址
+            api_key="sk-CkxIb6MfdTBgZkdm0MtUEGVGk6Q6o5X5BRB1DwE2BdeSLSqB"  # 本地服务不需要API密钥
+        )
+        
+        # 添加计数器
+        self.human_count = 0
+        self.false_count = 0
+
     def start(self):
         """启动视频流处理"""
         self.is_running = True
@@ -77,67 +68,93 @@ class ESP32_Camera_Stream:
             if not self.is_running:
                 break
                 
+    def detect_human(self, frame):
+        """使用GPT4O-mini检测图像中是否有人
+        
+        Args:
+            frame: OpenCV格式的图像帧
+        
+        Returns:
+            bool: 图像中是否检测到人
+        """
+        # 将OpenCV图像转换为PIL格式并保存为base64
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(frame_rgb)
+        img_byte_arr = io.BytesIO()
+        pil_image.save(img_byte_arr, format='JPEG')
+        img_base64 = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+        
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "这张图片中是否有人？请只回答true或false。"},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{img_base64}"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=10
+            )
+            result = response.choices[0].message.content.strip().lower()
+            return result == "true"
+            
+        except Exception as e:
+            print(f"GPT4O-mini API调用错误: {e}")
+            return False
+
     def process_frames(self):
-        """处理视频帧并进行目标检测"""
-        fps_time = time.time()
-        frames_count = 0
+        """每3秒处理一帧并显示"""
+        last_frame_time = time.time()
         
         while True:
-            if not self.frame_queue.empty():
+            current_time = time.time()
+            
+            if not self.frame_queue.empty() and (current_time - last_frame_time) >= 3:
                 frame = self.frame_queue.get()
+                last_frame_time = current_time
                 
-                # 运行YOLO检测
-                results = self.model(frame, stream=True)
+                # 使用GPT4O-mini检测人
+                has_human = self.detect_human(frame)
                 
-                # 在图像上绘制检测结果并发送到ESP32
-                detection_results = []  # 存储检测结果
-                for r in results:
-                    boxes = r.boxes
-                    for box in boxes:
-                        # 获取类别和置信度
-                        cls = int(box.cls)
-                        conf = float(box.conf)
-                        name = self.model.names[cls]
-                        
-                        # 只在置信度大于0.5时处理
-                        if conf > 0.5:
-                            # 只将类别号添加到列表
-                            detection_results.append(str(cls))
-                        
-                        # 获取边界框坐标
-                        x1, y1, x2, y2 = box.xyxy[0]
-                        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                        
-                        # 获取该类别对应的颜色
-                        color = self.colors[cls]
-                        
-                        # 使用对应颜色绘制边界框和标签
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                        cv2.putText(frame, f'{name} {conf:.2f}', 
-                                  (x1, y1 - 10), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 
-                                  0.5, color, 2)
+                # 更新计数器并打印状态
+                if has_human:
+                    self.human_count += 1
+                    self.false_count = 0  # 重置false计数
+                    print(f"检测到人，当前累计次数: {self.human_count}")
+                else:
+                    self.false_count += 1
+                    print(f"未检测到人，连续{self.false_count}次，当前累计次数: {self.human_count}")
+                    if self.false_count >= 2:  # 两次False时重置计数
+                        self.human_count = 0
+                        self.false_count = 0
+                        print("连续两次未检测到人，计数已重置")
                 
-                # 如果有检测结果且socket连接可用，发送到ESP32
-                if detection_results and self.socket_client:
-                    try:
-                        # 将所有类别号组合成一个字符串，用分号分隔
-                        message = ";".join(detection_results) + "\n"
-                        self.socket_client.send(message.encode())
-                    except Exception as e:
-                        print(f"发送数据失败: {e}")
+                # 检查累计次数并打印
+                if self.human_count == 10:
+                    print("达到10次 -> 1H")
+                elif self.human_count == 20:
+                    print("达到20次 -> 2H")
+                    self.human_count = 0  # 达到20次后重置计数
+                    print("计数已重置为0")
                 
-                # 计算并显示FPS
-                frames_count += 1
-                if time.time() - fps_time > 1.0:
-                    fps = frames_count / (time.time() - fps_time)
-                    cv2.putText(frame, f'FPS: {fps:.1f}',
-                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                              1, (0, 255, 0), 2)
-                    frames_count = 0
-                    fps_time = time.time()
+                # 显示时间戳和检测结果
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                cv2.putText(frame, timestamp,
+                          (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                          1, (0, 255, 0), 2)
+                cv2.putText(frame, f"Has Human: {has_human} (Count: {self.human_count})",
+                          (10, 70), cv2.FONT_HERSHEY_SIMPLEX,
+                          1, (0, 255, 0), 2)
                 
-                # 显示处理后的帧（使用类中定义的窗口名称）
+                # 显示处理后的帧
                 cv2.imshow(self.window_name, frame)
                 
             if cv2.waitKey(1) & 0xFF == ord('q'):

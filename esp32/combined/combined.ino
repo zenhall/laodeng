@@ -3,12 +3,16 @@
 #include <WiFi.h>
 #include <SCServo.h>
 #include <ArduinoJson.h>
+#include "esp_camera.h"
+#define CAMERA_MODEL_XIAO_ESP32S3 // Has PSRAM
+#include "camera_pins.h"
 
 // FreeRTOS相关
 TaskHandle_t wifiCommandTaskHandle;
 TaskHandle_t micTaskHandle;
 TaskHandle_t servoTaskHandle;
 TaskHandle_t statusTaskHandle;
+TaskHandle_t cameraTaskHandle;
 
 // WiFi设置
 const char* ssid = "2nd-curv";
@@ -45,6 +49,9 @@ byte ACC[5];
 // JSON文档
 StaticJsonDocument<200> cmdDoc;
 StaticJsonDocument<500> statusDoc;
+
+// 添加TCP服务器对象
+WiFiServer ServerPort(1234);
 
 // 处理接收到的命令
 void handleCommand(const char* command) {
@@ -201,9 +208,83 @@ void statusTask(void *parameter) {
   }
 }
 
+// 添加摄像头任务处理函数
+void cameraTask(void *parameter) {
+  while(1) {
+    WiFiClient client = ServerPort.available();
+    if (client) {
+      Serial.println("新客户端连接");
+      
+      while (client.connected()) {
+        if (client.available()) {
+          // 读取检测结果
+          String data = client.readStringUntil('\n');
+          
+          // 解析并显示每个检测结果
+          Serial.println("检测结果:");
+          
+          // 按分号分割字符串
+          int prevIndex = 0;
+          int colonIndex = -1;
+          
+          while ((colonIndex = data.indexOf(';', prevIndex)) != -1) {
+            String detection = data.substring(prevIndex, colonIndex);
+            Serial.println(detection);
+            prevIndex = colonIndex + 1;
+          }
+          
+          if (prevIndex < data.length()) {
+            Serial.println(data.substring(prevIndex));
+          }
+          
+          client.println("Data received");
+        }
+      }
+      
+      client.stop();
+      Serial.println("客户端断开连接");
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   
+  // 初始化摄像头
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.frame_size = FRAMESIZE_QVGA;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x", err);
+    return;
+  }
+
   // 初始化LED
   pixels.begin();
   pixels.clear();
@@ -235,10 +316,16 @@ void setup() {
     ACC[i] = 50;
   }
 
+  // 启动TCP服务器
+  ServerPort.begin();
+  
   // 创建任务
   xTaskCreate(wifiCommandTask, "Command Task", 4096, NULL, 2, &wifiCommandTaskHandle);
   xTaskCreate(micTask, "Mic Task", 4096, NULL, 2, &micTaskHandle);
   xTaskCreate(statusTask, "Status Task", 4096, NULL, 1, &statusTaskHandle);
+  
+  // 创建摄像头任务
+  xTaskCreate(cameraTask, "Camera Task", 4096, NULL, 1, &cameraTaskHandle);
 }
 
 void loop() {
