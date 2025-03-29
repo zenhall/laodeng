@@ -261,9 +261,9 @@ def on_open(ws):
 
 def main():
     wsParam = Ws_Param(
-        APPID='872c31f2',
-        APISecret='NmQyMTA2NmM4NjU5MDA2OTZlM2EwZTcz',
-        APIKey='126cb1b4434af61f124e03c4d266b9ea'
+        APPID='',
+        APISecret='',
+        APIKey=''
     )
     websocket.enableTrace(False)
     wsUrl = wsParam.create_url()

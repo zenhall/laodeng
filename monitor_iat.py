@@ -13,7 +13,7 @@ proxies = {
     'https': 'http://127.0.0.1:7890'
 }
 
-openai.api_key = "sk-CkxIb6MfdTBgZkdm0MtUEGVGk6Q6o5X5BRB1DwE2BdeSLSqB"
+openai.api_key = ""
 openai.api_base = "https://api.chatanywhere.tech/v1"
 
 # 添加简化版的 AI 对话类
